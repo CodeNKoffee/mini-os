@@ -135,7 +135,7 @@ static int allocateMemory(SystemState *sys, int words)
 }
 
 // Returns true on success, false on failure
-bool loadProgram(SystemState *sys, const char *filename, int arrivalTime)
+bool loadProgram(SystemState *sys, const char *filename)
 {
   if (sys->processCount >= MAX_PROCESSES)
   {
@@ -202,7 +202,7 @@ bool loadProgram(SystemState *sys, const char *filename, int arrivalTime)
   pcb->programCounter = 0;
   pcb->memoryLowerBound = lb;
   pcb->memoryUpperBound = ub;
-  pcb->arrivalTime = arrivalTime;
+  pcb->arrivalTime = sys->clockCycle;
   pcb->blockedOnResource = (ResourceType)-1; // Use -1 to indicate not blocked
   pcb->quantumRemaining = 0;
   pcb->mlfqLevel = 0; // Start at highest level
@@ -271,7 +271,7 @@ bool loadProgram(SystemState *sys, const char *filename, int arrivalTime)
   }
 
   sim_log(sys, "Loaded P%d: lines=%d, mem=[%d..%d], arrival=%d",
-          pcb->programNumber, linesRead, lb, ub, pcb->arrivalTime);
+          pcb->programNumber, linesRead, lb, ub, sys->clockCycle);
   sys->processCount++;
   notify_state_update(sys); // Notify GUI about the new process
   return true;
@@ -335,85 +335,63 @@ static void addToReadyQueue(SystemState *sys, int pid)
 
 static void addToMLFQ(SystemState *sys, int pid, int level)
 {
-  if (level < 0 || level >= MLFQ_LEVELS)
-  {
-    sim_log(sys, "Error: Invalid MLFQ level %d for P%d", level, pid);
-    return;
-  }
-  if (sys->mlfqSize[level] >= MAX_QUEUE_SIZE)
-  {
-    // Policy: If the target queue is full, try the next lower priority queue.
-    // If all lower queues are full, drop (or handle differently).
-    sim_log(sys, "Warning: MLFQ level %d full, trying next level for P%d", level, pid);
-    if (level + 1 < MLFQ_LEVELS)
-    {
-      addToMLFQ(sys, pid, level + 1);
+    if (level < 0 || level >= MLFQ_LEVELS) {
+        sim_log(sys, "Error: Invalid MLFQ level %d for P%d", level, pid);
+        return;
     }
-    else
-    {
-      sim_log(sys, "Error: All lower MLFQ levels full, dropping P%d", pid);
-      PCB *pcb = findPCB(sys, pid);
-      if (pcb)
-        pcb->state = TERMINATED; // Mark as terminated if dropped
-    }
-    return;
-  }
-  PCB *pcb = findPCB(sys, pid);
-  if (!pcb)
-    return; // Should not happen
 
-  pcb->state = READY;
-  pcb->mlfqLevel = level;
-  pcb->priority = level; // Priority matches level (lower level = higher priority)
-
-  // If this process was unblocked this cycle, add it to the front of the queue
-  if (sys->wasUnblockedThisCycle[pid])
-  {
-    // Shift all existing processes one position forward
-    for (int i = sys->mlfqTail[level]; i != sys->mlfqHead[level]; i = (i - 1 + MAX_QUEUE_SIZE) % MAX_QUEUE_SIZE)
-    {
-      sys->mlfqRQ[level][i] = sys->mlfqRQ[level][(i - 1 + MAX_QUEUE_SIZE) % MAX_QUEUE_SIZE];
+    /* If the chosen queue is already full, keep the project’s
+       “spill-to-lower-level” policy unchanged … */
+    if (sys->mlfqSize[level] >= MAX_QUEUE_SIZE) {
+        sim_log(sys, "Warning: MLFQ level %d full, trying next level for P%d",
+                level, pid);
+        if (level + 1 < MLFQ_LEVELS)
+            addToMLFQ(sys, pid, level + 1);
+        else {
+            sim_log(sys, "Error: All MLFQ levels full - terminating P%d", pid);
+            PCB *pcb = findPCB(sys, pid);
+            if (pcb) pcb->state = TERMINATED;
+        }
+        return;
     }
-    // Add the unblocked process at the head
-    sys->mlfqRQ[level][sys->mlfqHead[level]] = pid;
-    sys->mlfqHead[level] = (sys->mlfqHead[level] - 1 + MAX_QUEUE_SIZE) % MAX_QUEUE_SIZE;
-  }
-  else
-  {
-    // Normal case: add to the back of the queue
-    sys->mlfqRQ[level][sys->mlfqTail[level]] = pid;
+
+    PCB *pcb = findPCB(sys, pid);
+    if (!pcb) return;
+
+    pcb->state     = READY;
+    pcb->mlfqLevel = level;
+    pcb->priority  = level;
+
+    /* ----------  *the only behavioural change*  ---------- */
+    sys->mlfqRQ[level][sys->mlfqTail[level]] = pid;          // enqueue
     sys->mlfqTail[level] = (sys->mlfqTail[level] + 1) % MAX_QUEUE_SIZE;
-  }
-  sys->mlfqSize[level]++;
+    sys->mlfqSize[level]++;
 }
 
 // Combined scheduler: returns PID of next process to run, or -1 if none
 static int scheduleNextProcess(SystemState *sys)
 {
-  if (sys->schedulerType == SIM_SCHED_MLFQ)
-  {
-    for (int lvl = 0; lvl < MLFQ_LEVELS; lvl++)
-    {
-      if (sys->mlfqSize[lvl] > 0)
-      {
-        int pid = sys->mlfqRQ[lvl][sys->mlfqHead[lvl]];
-        sys->mlfqHead[lvl] = (sys->mlfqHead[lvl] + 1) % MAX_QUEUE_SIZE;
-        sys->mlfqSize[lvl]--;
-        return pid;
-      }
+    if (sys->schedulerType == SIM_SCHED_MLFQ) {
+        for (int lvl = 0; lvl < MLFQ_LEVELS; lvl++) {
+            while (sys->mlfqSize[lvl] > 0) {
+                int pid = sys->mlfqRQ[lvl][sys->mlfqHead[lvl]];
+                sys->mlfqHead[lvl] = (sys->mlfqHead[lvl] + 1) % MAX_QUEUE_SIZE;
+                sys->mlfqSize[lvl]--;
+                /* ⬇️  NEW: ignore anything that is no longer READY */
+                if (findPCB(sys, pid)->state == READY)
+                    return pid;
+            }
+        }
+    } else {
+        while (sys->readySize > 0) {
+            int pid = sys->readyQueue[sys->readyHead];
+            sys->readyHead = (sys->readyHead + 1) % MAX_QUEUE_SIZE;
+            sys->readySize--;
+            if (findPCB(sys, pid)->state == READY)
+                return pid;
+        }
     }
-  }
-  else
-  { // FCFS or RR (use the same simple queue)
-    if (sys->readySize > 0)
-    {
-      int pid = sys->readyQueue[sys->readyHead];
-      sys->readyHead = (sys->readyHead + 1) % MAX_QUEUE_SIZE;
-      sys->readySize--;
-      return pid;
-    }
-  }
-  return -1; // No process ready
+    return -1;      // nothing runnable
 }
 
 // ------------- Interpreter -------------

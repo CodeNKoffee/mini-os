@@ -139,7 +139,7 @@ struct GuiCallbacks
 
 // Function prototypes
 void initializeSystem(SystemState *sys, SchedulerType type, int rrQuantumVal, GuiCallbacks *callbacks, void *gui_data);
-bool loadProgram(SystemState *sys, const char *filename, int arrivalTime);
+bool loadProgram(SystemState *sys, const char *filename);
 void stepSimulation(SystemState *sys); // Executes one cycle or one event
 bool isSimulationComplete(SystemState *sys);
 PCB *findPCB(SystemState *sys, int pid);
