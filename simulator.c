@@ -811,7 +811,7 @@ void provideInput(SystemState *sys, const char *input)
     return;
   }
 
-  sim_log(sys, "P%d received input '%s' for variable '%s'", sys->inputPid, input ? input : "<NULL>", sys->inputVarName);
+  sim_log(sys, "P%d received input '%s' for variable '%s'", pcb->programNumber, input ? input : "<NULL>", sys->inputVarName);
 
   if (input)
   {
@@ -820,7 +820,7 @@ void provideInput(SystemState *sys, const char *input)
   else
   {
     // Handle case where input was cancelled or failed (e.g., treat as empty string or error?)
-    sim_log(sys, "P%d received NULL input for '%s'. Treating as empty string.", sys->inputPid, sys->inputVarName);
+    sim_log(sys, "P%d received NULL input for '%s'. Treating as empty string.", pcb->programNumber, sys->inputVarName);
     setVariable(sys, sys->inputPid, sys->inputVarName, "");
   }
 
