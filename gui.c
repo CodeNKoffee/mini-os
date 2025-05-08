@@ -1,4 +1,5 @@
 #include <gtk/gtk.h>
+#include <gtk/gtknativedialog.h>
 #include "simulator.h"
 #include <glib.h>
 #include <stdarg.h> // For va_list support
@@ -21,9 +22,11 @@ typedef struct
   GtkWidget *load_p1_button;
   GtkWidget *load_p2_button;
   GtkWidget *load_p3_button;
-  GtkWidget *status_bar;        // To show current cycle, running process etc.
-  GtkWidget *process_list_view; // Placeholder for process display
-  GtkWidget *memory_view;       // Placeholder for memory display
+  GtkWidget *status_bar;               // To show current cycle, running process etc.
+  GtkTextView *process_list_text_view; // NEW - for process/queue details
+  GtkTextBuffer *process_list_buffer;  // NEW
+  GtkTextView *memory_text_view;       // NEW - for memory map
+  GtkTextBuffer *memory_buffer;        // NEW
 
   // Widgets for embedded input prompt
   GtkWidget *input_prompt_box; // Container for input widgets
@@ -44,6 +47,8 @@ typedef struct
   int input_process_id;
   char *input_var_name;
   bool input_numeric;
+
+  GtkWidget *add_process_button; // NEW - To manage sensitivity
 
 } GuiApp; // Renamed from AppData for clarity
 
@@ -68,6 +73,11 @@ static gboolean unflash_input_area(GtkWidget *frame);
 static void gui_add_status_message(GuiApp *gui_app, const char *message);
 static void on_quick_input_button_clicked(GtkButton *button, gpointer user_data);
 static char *format_process_list_and_queues(SystemState *sys);
+static void on_add_process_clicked(GtkButton *button G_GNUC_UNUSED, gpointer user_data);
+// --- Start: New forward declarations for dialog response handlers ---
+static void on_arrival_dialog_response(GtkDialog *dialog, gint response_id, gpointer user_data);
+static void on_file_chooser_native_response(GtkNativeDialog *native, gint response_id, gpointer user_data);
+// --- End: New forward declarations ---
 
 // Macro for logging - defined after forward declarations
 #define LOG(format, ...) gui_log_message(gui_app, format, ##__VA_ARGS__)
@@ -200,17 +210,17 @@ static gboolean gui_request_input_internal(GuiApp *gui_app, int process_id, cons
   return TRUE;
 }
 
-// Helper functions for flashing the input area
+// Helper functions for flashing the input area (RE-ADD definitions)
 static gboolean flash_input_area(GtkWidget *frame)
 {
   gtk_widget_add_css_class(frame, "input-flash");
-  return FALSE;
+  return G_SOURCE_REMOVE; // Timer should run only once
 }
 
 static gboolean unflash_input_area(GtkWidget *frame)
 {
   gtk_widget_remove_css_class(frame, "input-flash");
-  return FALSE;
+  return G_SOURCE_REMOVE; // Timer should run only once
 }
 
 // Handler for the Submit Input button
@@ -250,129 +260,150 @@ static void gui_state_update(void *gui_data, SystemState *sys G_GNUC_UNUSED)
 static void update_ui_from_state(GuiApp *gui_app)
 {
   SystemState *sys = &gui_app->sim_state;
-  char status_text[200];
-  const char *running_status = "Idle";
-  bool is_waiting_for_input = sys->needsInput;
+  char status_text[256];
+  const char *scheduler_name = "Unknown";
 
-  // --- Determine Control Sensitivity ---
-  bool sim_complete = isSimulationComplete(sys);
-  // Only allow step/run if there is at least one process loaded
-  bool has_processes = sys->processCount > 0;
-  bool can_step = !sim_complete && !gui_app->is_running && !is_waiting_for_input && has_processes;
-  bool can_run = !sim_complete && !gui_app->is_running && !is_waiting_for_input && has_processes;
-  bool can_reset = !gui_app->is_running && !is_waiting_for_input;
-  bool can_load = !gui_app->is_running && !is_waiting_for_input && (sys->processCount < MAX_PROCESSES);
-  bool can_change_sched = !gui_app->is_running && !is_waiting_for_input && sys->processCount == 0;
-
-  // --- Update Status Bar ---
-  if (is_waiting_for_input)
+  // 1. Update Process List and Queue Views
+  char *process_queue_info = format_process_list_and_queues(sys);
+  if (gui_app->process_list_buffer)
   {
-    // Use the prompt label text for more specific status
-    running_status = gtk_label_get_text(GTK_LABEL(gui_app->input_prompt_label));
+    gtk_text_buffer_set_text(gui_app->process_list_buffer, process_queue_info ? process_queue_info : "", -1);
   }
-  else if (sys->runningProcessID >= 0)
+
+  // 2. Update Memory View
+  char memory_map_text[MEMORY_SIZE * 150 + 1]; // Ensure enough space +1 for null terminator
+  memory_map_text[0] = '\0';
+  char line_buffer[150];
+  size_t current_map_len = 0;
+
+  for (int i = 0; i < MEMORY_SIZE; ++i)
+  {
+    char name_display[51];
+    char value_display[51];
+    strncpy(name_display, sys->memory[i].name, 50);
+    name_display[50] = '\0';
+    strncpy(value_display, sys->memory[i].value, 50);
+    value_display[50] = '\0';
+
+    int written = snprintf(line_buffer, sizeof(line_buffer), "W%02d: [%s] = [%s]\n",
+                           i, name_display, value_display);
+    if (current_map_len + written < sizeof(memory_map_text))
+    {
+      strcat(memory_map_text, line_buffer);
+      current_map_len += written;
+    }
+    else
+    {
+      // Buffer full, append truncation message if possible
+      const char *trunc_msg = "... (memory map truncated) ...\n";
+      if (sizeof(memory_map_text) - current_map_len > strlen(trunc_msg))
+      {
+        strcat(memory_map_text, trunc_msg);
+      }
+      break;
+    }
+  }
+  if (gui_app->memory_buffer)
+  {
+    gtk_text_buffer_set_text(gui_app->memory_buffer, memory_map_text, -1);
+  }
+
+  // 3. Update Status Bar
+  switch (sys->schedulerType)
+  {
+  case SIM_SCHED_FCFS:
+    scheduler_name = "FCFS";
+    break;
+  case SIM_SCHED_RR:
+    scheduler_name = "Round Robin";
+    break;
+  case SIM_SCHED_MLFQ:
+    scheduler_name = "MLFQ";
+    break;
+  }
+  char running_process_str[50] = "CPU Idle";
+  if (sys->runningProcessID != -1)
   {
     PCB *pcb = findPCB(sys, sys->runningProcessID);
     if (pcb)
     {
-      // Use different buffer for running status to avoid conflict with main status_text
-      char running_status_buf[100];
-      if (sys->schedulerType == SIM_SCHED_MLFQ)
-      {
-        snprintf(running_status_buf, sizeof(running_status_buf), "Running: P%d (L%d, Q%d)", sys->runningProcessID, pcb->mlfqLevel, pcb->quantumRemaining);
-      }
-      else if (sys->schedulerType == SIM_SCHED_RR)
-      {
-        snprintf(running_status_buf, sizeof(running_status_buf), "Running: P%d (Q%d)", sys->runningProcessID, pcb->quantumRemaining);
-      }
-      else
-      {
-        snprintf(running_status_buf, sizeof(running_status_buf), "Running: P%d", sys->runningProcessID);
-      }
-      running_status = running_status_buf; // Point to the detailed status
+      snprintf(running_process_str, sizeof(running_process_str), "P%d Running", pcb->programNumber);
+    }
+    else
+    {
+      snprintf(running_process_str, sizeof(running_process_str), "P%d Invalid", sys->runningProcessID);
     }
   }
 
-  snprintf(status_text, sizeof(status_text), "Cycle: %d | %s | %s",
-           sys->clockCycle,
-           sys->schedulerType == SIM_SCHED_FCFS ? "FCFS" : sys->schedulerType == SIM_SCHED_RR ? "RR"
-                                                                                              : "MLFQ",
-           running_status);
-  gtk_label_set_text(GTK_LABEL(gui_app->status_bar), status_text);
-
-  // --- Update Quick Input Label ---
-  if (is_waiting_for_input)
+  if (sys->simulationComplete)
   {
-    // Find the parent box of the quick input entry
-    GtkWidget *parent_box = gtk_widget_get_parent(gui_app->quick_input_entry);
-    if (parent_box)
-    {
-      // Find the label which is the first child in the box
-      GtkWidget *label = gtk_widget_get_first_child(parent_box);
-      if (GTK_IS_LABEL(label))
-      {
-        char label_text[100];
-        PCB *pcb = findPCB(sys, sys->inputPid);
-        if (pcb)
-        {
-          snprintf(label_text, sizeof(label_text), "Input for P%d, var %s:",
-                   pcb->programNumber, sys->inputVarName);
-        }
-        else
-        {
-          snprintf(label_text, sizeof(label_text), "Input for unknown process, var %s:",
-                   sys->inputVarName);
-        }
-        gtk_label_set_text(GTK_LABEL(label), label_text);
-      }
-    }
-
-    // Also give focus to the quick input entry for convenience
-    gtk_widget_grab_focus(gui_app->quick_input_entry);
+    snprintf(status_text, sizeof(status_text), "Simulation Complete! Clock: %d | Scheduler: %s",
+             sys->clockCycle, scheduler_name);
+  }
+  else if (sys->needsInput)
+  {
+    PCB *input_pcb = findPCB(sys, sys->inputPid);
+    snprintf(status_text, sizeof(status_text), "Paused for Input (P%d for %s) | Clock: %d | Scheduler: %s",
+             input_pcb ? input_pcb->programNumber : sys->inputPid, sys->inputVarName, sys->clockCycle, scheduler_name);
   }
   else
   {
-    // Reset to default label when input is not needed
-    GtkWidget *parent_box = gtk_widget_get_parent(gui_app->quick_input_entry);
-    if (parent_box)
-    {
-      GtkWidget *label = gtk_widget_get_first_child(parent_box);
-      if (GTK_IS_LABEL(label))
-      {
-        gtk_label_set_text(GTK_LABEL(label), "Input Value:");
-      }
-    }
+    snprintf(status_text, sizeof(status_text), "%s | Clock: %d | Scheduler: %s",
+             running_process_str, sys->clockCycle, scheduler_name);
+  }
+  if (gui_app->status_bar)
+  {
+    gtk_label_set_text(GTK_LABEL(gui_app->status_bar), status_text);
   }
 
-  // --- Update Widget Sensitivity ---
-  gtk_widget_set_sensitive(gui_app->step_button, can_step);
-  gtk_widget_set_sensitive(gui_app->run_button, can_run);
-  gtk_button_set_label(GTK_BUTTON(gui_app->run_button), gui_app->is_running ? "_Pause" : "_Run"); // Label changes based on is_running
-  gtk_widget_set_sensitive(gui_app->reset_button, can_reset);
-  gtk_widget_set_sensitive(gui_app->load_p1_button, can_load);
-  gtk_widget_set_sensitive(gui_app->load_p2_button, can_load);
-  gtk_widget_set_sensitive(gui_app->load_p3_button, can_load);
-  gtk_widget_set_sensitive(GTK_WIDGET(gui_app->scheduler_dropdown), can_change_sched);
+  // 4. Update Button and Widget Sensitivity
+  bool sim_can_progress = !sys->simulationComplete && !sys->needsInput;
+  bool can_load_new_process = !gui_app->is_running && (sys->processCount < MAX_PROCESSES);
 
-  // Highlight the quick input when input is required
-  gtk_widget_set_sensitive(gui_app->quick_input_button, is_waiting_for_input);
-  if (is_waiting_for_input)
+  if (gui_app->step_button)
+    gtk_widget_set_sensitive(gui_app->step_button, sim_can_progress);
+  if (gui_app->run_button)
+  {
+    gtk_widget_set_sensitive(gui_app->run_button, sim_can_progress);
+    gtk_button_set_label(GTK_BUTTON(gui_app->run_button), gui_app->is_running ? "_Pause" : "_Run");
+    // Add/remove CSS class for run/pause state visual feedback if desired
+    if (gui_app->is_running)
+    {
+      gtk_widget_remove_css_class(gui_app->run_button, "run-button");
+      gtk_widget_add_css_class(gui_app->run_button, "stop-button"); // Assumes a "stop-button" class is defined for pause
+    }
+    else
+    {
+      gtk_widget_remove_css_class(gui_app->run_button, "stop-button");
+      gtk_widget_add_css_class(gui_app->run_button, "run-button");
+    }
+  }
+  if (gui_app->reset_button)
+    gtk_widget_set_sensitive(gui_app->reset_button, !gui_app->is_running); // Can reset if not auto-running
+  if (gui_app->add_process_button)
+    gtk_widget_set_sensitive(gui_app->add_process_button, can_load_new_process);
+
+  // Scheduler and Quantum entry sensitivity
+  // Only allow changing scheduler if no processes are loaded OR if not auto-running and simulation is not complete/paused
+  bool can_change_scheduler = (sys->processCount == 0) || (!gui_app->is_running && !sys->simulationComplete && !sys->needsInput);
+  if (gui_app->scheduler_dropdown)
+    gtk_widget_set_sensitive(GTK_WIDGET(gui_app->scheduler_dropdown), can_change_scheduler);
+  if (gui_app->rr_quantum_entry)
+    gtk_widget_set_sensitive(gui_app->rr_quantum_entry, can_change_scheduler && (sys->schedulerType == SIM_SCHED_RR));
+
+  // Sensitivity of quick input button (distinct from the main input prompt)
+  if (gui_app->quick_input_button)
+    gtk_widget_set_sensitive(gui_app->quick_input_button, sys->needsInput);
+  if (gui_app->quick_input_entry)
+    gtk_widget_set_sensitive(gui_app->quick_input_entry, sys->needsInput);
+  if (sys->needsInput && gui_app->quick_input_entry)
   {
     gtk_widget_add_css_class(gui_app->quick_input_entry, "input-flash");
   }
-  else
+  else if (gui_app->quick_input_entry)
   {
     gtk_widget_remove_css_class(gui_app->quick_input_entry, "input-flash");
   }
-
-  guint selected_scheduler_index = gtk_drop_down_get_selected(gui_app->scheduler_dropdown);
-  gtk_widget_set_sensitive(gui_app->rr_quantum_entry, can_change_sched && (selected_scheduler_index == 1));
-
-  // Input widgets sensitivity is handled by visibility in gui_request_input / on_submit_input
-
-  // --- Update Process List and Queue Views ---
-  char *process_info = format_process_list_and_queues(sys);
-  gtk_label_set_text(GTK_LABEL(gui_app->process_list_view), process_info);
 }
 
 // --- Button Handlers ---
@@ -504,14 +535,13 @@ static void on_load_program_clicked(GtkButton *button, gpointer user_data)
 
   if (filename)
   {
-    gui_log_message(gui_app, "Attempting to load..."); // Log before potential block
-    bool success = loadProgram(&gui_app->sim_state, filename);
-    // Status logged by loadProgram via callback
+    gui_log_message(gui_app, "Attempting to load program %s with arrival time %d...", filename, arrival);
+    bool success = loadProgram(&gui_app->sim_state, filename, arrival);
+
     if (!success)
     {
-      gui_log_message(gui_app, "Load failed.");
+      gui_log_message(gui_app, "Load failed for %s.", filename);
     }
-    // Update UI based on potentially new process count etc.
     update_ui_from_state(gui_app);
   }
 }
@@ -685,46 +715,179 @@ static char *format_process_list_and_queues(SystemState *sys)
     }
   }
 
-  // Blocked Processes
-  offset += snprintf(buffer + offset, sizeof(buffer) - offset, "\nBlocked Processes:\n");
+  // Mutex Holder Info - ADDED SECTION
+  offset += snprintf(buffer + offset, sizeof(buffer) - offset, "\n=== Mutex Status ===\n");
   for (int r = 0; r < NUM_RESOURCES; r++)
   {
+    const char *res_name_held;
+    switch (r)
+    {
+    case RESOURCE_FILE:
+      res_name_held = "File";
+      break;
+    case RESOURCE_USER_INPUT:
+      res_name_held = "User Input";
+      break;
+    case RESOURCE_USER_OUTPUT:
+      res_name_held = "User Output";
+      break;
+    default:
+      res_name_held = "Unknown";
+    }
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%s: ", res_name_held);
+    if (sys->mutexes[r].locked)
+    {
+      PCB *holder_pcb = findPCB(sys, sys->mutexes[r].lockingProcessID);
+      if (holder_pcb)
+      {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "Held by P%d. Waiting: ", holder_pcb->programNumber);
+      }
+      else
+      {
+        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "Held by P%d (Error: PCB not found). Waiting: ", sys->mutexes[r].lockingProcessID);
+      }
+    }
+    else
+    {
+      offset += snprintf(buffer + offset, sizeof(buffer) - offset, "(Not locked). Waiting: ");
+    }
+    // List waiting processes for this mutex
     if (sys->mutexes[r].size > 0)
     {
-      const char *res_name;
-      switch (r)
+      int idx_wait = sys->mutexes[r].head;
+      for (int i_wait = 0; i_wait < sys->mutexes[r].size; i_wait++)
       {
-      case RESOURCE_FILE:
-        res_name = "File";
-        break;
-      case RESOURCE_USER_INPUT:
-        res_name = "User Input";
-        break;
-      case RESOURCE_USER_OUTPUT:
-        res_name = "User Output";
-        break;
-      default:
-        res_name = "Unknown";
-      }
-      offset += snprintf(buffer + offset, sizeof(buffer) - offset,
-                         "%s: ", res_name);
-      int idx = sys->mutexes[r].head;
-      for (int i = 0; i < sys->mutexes[r].size; i++)
-      {
-        int pid = sys->mutexes[r].blockedQueue[idx];
-        PCB *pcb = findPCB(sys, pid);
-        if (pcb)
+        int pid_wait = sys->mutexes[r].blockedQueue[idx_wait];
+        PCB *pcb_wait = findPCB(sys, pid_wait);
+        if (pcb_wait)
         {
-          offset += snprintf(buffer + offset, sizeof(buffer) - offset,
-                             "P%d ", pcb->programNumber);
+          offset += snprintf(buffer + offset, sizeof(buffer) - offset, "P%d ", pcb_wait->programNumber);
         }
-        idx = (idx + 1) % MAX_QUEUE_SIZE;
+        idx_wait = (idx_wait + 1) % MAX_QUEUE_SIZE;
       }
-      offset += snprintf(buffer + offset, sizeof(buffer) - offset, "\n");
     }
+    else
+    {
+      offset += snprintf(buffer + offset, sizeof(buffer) - offset, "(none)");
+    }
+    offset += snprintf(buffer + offset, sizeof(buffer) - offset, "\n");
   }
+  // END OF ADDED SECTION - Blocked Processes list can be removed if this is sufficient
 
   return buffer;
+}
+
+// Helper struct to pass filepath and gui_app to arrival_dialog_response
+typedef struct
+{
+  GuiApp *app_data;
+  char *filepath;
+} ArrivalDialogLoadData;
+
+// Response handler for the arrival time dialog
+static void on_arrival_dialog_response(GtkDialog *dialog, gint response_id, gpointer user_data)
+{
+  ArrivalDialogLoadData *load_data = (ArrivalDialogLoadData *)user_data;
+  GuiApp *gui_app = load_data->app_data;
+
+  if (response_id == GTK_RESPONSE_ACCEPT)
+  {
+    GtkWidget *content_area = gtk_dialog_get_content_area(dialog); // Deprecated but part of original structure
+    GtkWidget *arrival_hbox = gtk_widget_get_first_child(content_area);
+    GtkWidget *arrival_spin_button = gtk_widget_get_last_child(arrival_hbox);
+
+    if (GTK_IS_SPIN_BUTTON(arrival_spin_button))
+    {
+      int arrival_time = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(arrival_spin_button));
+      gui_log_message(gui_app, "Loading program '%s' with arrival time %d...", load_data->filepath, arrival_time);
+      bool success = loadProgram(&gui_app->sim_state, load_data->filepath, arrival_time);
+      if (!success)
+      {
+        gui_log_message(gui_app, "Load failed for %s.", load_data->filepath);
+      }
+      update_ui_from_state(gui_app);
+    }
+  }
+  g_free(load_data->filepath); // Free the duplicated filepath
+  g_slice_free(ArrivalDialogLoadData, load_data);
+  gtk_window_destroy(GTK_WINDOW(dialog));
+}
+
+// Response handler for GtkFileChooserNative
+static void on_file_chooser_native_response(GtkNativeDialog *native, gint response_id, gpointer user_data)
+{
+  GuiApp *gui_app = (GuiApp *)user_data;
+
+  if (response_id == GTK_RESPONSE_ACCEPT)
+  {
+    GFile *file = gtk_file_chooser_get_file(GTK_FILE_CHOOSER(native));
+    char *filepath = g_file_get_path(file);
+    g_object_unref(file);
+
+    // Now prompt for arrival time
+    GtkWidget *arrival_dialog = gtk_dialog_new_with_buttons(
+        "Set Arrival Time",
+        GTK_WINDOW(gui_app->main_window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "_OK", GTK_RESPONSE_ACCEPT,
+        "_Cancel", GTK_RESPONSE_REJECT,
+        NULL);
+    // gtk_dialog_get_content_area is deprecated, but part of original structure of arrival dialog
+    GtkWidget *content_area = gtk_dialog_get_content_area(GTK_DIALOG(arrival_dialog));
+    GtkWidget *arrival_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    GtkWidget *arrival_label = gtk_label_new("Arrival Time (cycles):");
+    GtkAdjustment *adjustment = gtk_adjustment_new(0.0, 0.0, 1000.0, 1.0, 5.0, 0.0);
+    GtkWidget *arrival_spin_button = gtk_spin_button_new(adjustment, 1.0, 0);
+
+    gtk_box_append(GTK_BOX(arrival_hbox), arrival_label);
+    gtk_box_append(GTK_BOX(arrival_hbox), arrival_spin_button);
+    gtk_widget_set_halign(arrival_hbox, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_top(arrival_hbox, 10);
+    gtk_widget_set_margin_bottom(arrival_hbox, 10);
+    gtk_widget_set_margin_start(arrival_hbox, 10);
+    gtk_widget_set_margin_end(arrival_hbox, 10);
+    gtk_box_append(GTK_BOX(content_area), arrival_hbox);
+    // gtk_widget_show_all(arrival_dialog); // gtk_widget_show should be enough for a dialog
+    gtk_widget_set_visible(arrival_dialog, TRUE);
+
+    ArrivalDialogLoadData *load_data = g_slice_new(ArrivalDialogLoadData);
+    load_data->app_data = gui_app;
+    load_data->filepath = filepath; // Ownership of filepath passes to load_data, will be freed in on_arrival_dialog_response
+
+    g_signal_connect(arrival_dialog, "response", G_CALLBACK(on_arrival_dialog_response), load_data);
+    gtk_window_set_modal(GTK_WINDOW(arrival_dialog), TRUE);
+    gtk_widget_show(GTK_WIDGET(arrival_dialog));
+  }
+  else
+  {
+    // User cancelled file chooser - no action needed, dialog closes itself
+  }
+  // gtk_native_dialog_destroy(native); // Native dialogs manage their own lifecycle after present
+}
+
+// Modified handler for "Add Process File..." button
+static void on_add_process_clicked(GtkButton *button G_GNUC_UNUSED, gpointer user_data)
+{
+  GuiApp *gui_app = (GuiApp *)user_data;
+
+  GtkFileChooserNative *native = gtk_file_chooser_native_new(
+      "Open Program File",
+      GTK_WINDOW(gui_app->main_window),
+      GTK_FILE_CHOOSER_ACTION_OPEN,
+      "_Open",    // accept_label
+      "_Cancel"); // cancel_label
+
+  GtkFileFilter *filter = gtk_file_filter_new();
+  gtk_file_filter_set_name(filter, "Text files (.txt)");
+  gtk_file_filter_add_pattern(filter, "*.txt");
+  // gtk_file_chooser_add_filter is for GtkFileChooser, for GtkFileChooserNative, use set_filter
+  gtk_file_chooser_set_filter(GTK_FILE_CHOOSER(native), filter);
+  g_object_unref(filter); // filter is owned by the chooser now, unref our initial hold
+
+  gtk_native_dialog_set_modal(GTK_NATIVE_DIALOG(native), TRUE);
+  g_signal_connect(native, "response", G_CALLBACK(on_file_chooser_native_response), gui_app);
+  gtk_native_dialog_show(GTK_NATIVE_DIALOG(native));
+  g_object_unref(native); // Release our reference, the dialog manages its own lifecycle
 }
 
 // --- Application Activation (UI Setup) ---
@@ -755,17 +918,17 @@ static void activate(GtkApplication *app, gpointer user_data)
   gui_app->scheduler_dropdown = GTK_DROP_DOWN(gtk_drop_down_new(G_LIST_MODEL(gui_app->scheduler_model), NULL));
   gtk_drop_down_set_selected(gui_app->scheduler_dropdown, 0); // Default FCFS
   gtk_box_append(GTK_BOX(control_hbox), GTK_WIDGET(gui_app->scheduler_dropdown));
-  // Connect scheduler change to enable/disable quantum entry
   g_signal_connect(gui_app->scheduler_dropdown, "notify::selected", G_CALLBACK(on_scheduler_changed), gui_app);
 
   // RR Quantum Entry
   GtkWidget *rr_label = gtk_label_new(" RR Q:");
   gui_app->rr_quantum_entry = gtk_entry_new();
-  gtk_editable_set_text(GTK_EDITABLE(gui_app->rr_quantum_entry), "2"); // Use gtk_editable_set_text
+  gtk_editable_set_text(GTK_EDITABLE(gui_app->rr_quantum_entry), "2");
   gtk_box_append(GTK_BOX(control_hbox), rr_label);
   gtk_box_append(GTK_BOX(control_hbox), gui_app->rr_quantum_entry);
 
-  // Load Buttons
+  // --- Start: Comment out old Load P1/P2/P3 buttons ---
+  /*
   gui_app->load_p1_button = gtk_button_new_with_label("Load P1");
   gui_app->load_p2_button = gtk_button_new_with_label("Load P2");
   gui_app->load_p3_button = gtk_button_new_with_label("Load P3");
@@ -776,6 +939,15 @@ static void activate(GtkApplication *app, gpointer user_data)
   gtk_box_append(GTK_BOX(control_hbox), gui_app->load_p1_button);
   gtk_box_append(GTK_BOX(control_hbox), gui_app->load_p2_button);
   gtk_box_append(GTK_BOX(control_hbox), gui_app->load_p3_button);
+  */
+  // --- End: Comment out old Load P1/P2/P3 buttons ---
+
+  // --- Start: Add new "Add Process File..." button ---
+  gui_app->add_process_button = gtk_button_new_with_label("Add Process File...");
+  g_signal_connect(gui_app->add_process_button, "clicked", G_CALLBACK(on_add_process_clicked), gui_app);
+  gtk_box_append(GTK_BOX(control_hbox), gtk_separator_new(GTK_ORIENTATION_VERTICAL));
+  gtk_box_append(GTK_BOX(control_hbox), gui_app->add_process_button);
+  // --- End: Add new "Add Process File..." button ---
 
   // Simulation Control Buttons
   gui_app->step_button = gtk_button_new_with_label("Step");
@@ -854,13 +1026,33 @@ static void activate(GtkApplication *app, gpointer user_data)
   gtk_paned_set_start_child(GTK_PANED(hpaned), left_vbox);
   gtk_paned_set_resize_start_child(GTK_PANED(hpaned), TRUE);
   gtk_paned_set_shrink_start_child(GTK_PANED(hpaned), FALSE);
-  // Add placeholders for Process List, Memory View, Queues etc.
-  gtk_box_append(GTK_BOX(left_vbox), gtk_label_new("--- Process/Queue State (TODO) ---"));
-  gui_app->process_list_view = gtk_label_new("(Process details here)"); // Replace with TreeView/ListView
-  gtk_box_append(GTK_BOX(left_vbox), gui_app->process_list_view);
-  gtk_box_append(GTK_BOX(left_vbox), gtk_label_new("--- Memory Map (TODO) ---"));
-  gui_app->memory_view = gtk_label_new("(Memory viz here)"); // Replace with DrawingArea or TextView
-  gtk_box_append(GTK_BOX(left_vbox), gui_app->memory_view);
+
+  // Process List/Queue View (using GtkTextView)
+  GtkWidget *process_list_frame = gtk_frame_new("Process & Queue Status");
+  GtkWidget *process_list_scrolled = gtk_scrolled_window_new();
+  gtk_widget_set_vexpand(process_list_scrolled, TRUE); // Allow vertical expansion
+  gui_app->process_list_text_view = GTK_TEXT_VIEW(gtk_text_view_new());
+  gui_app->process_list_buffer = gtk_text_view_get_buffer(gui_app->process_list_text_view);
+  gtk_text_view_set_editable(gui_app->process_list_text_view, FALSE);
+  gtk_text_view_set_cursor_visible(gui_app->process_list_text_view, FALSE);
+  gtk_text_view_set_wrap_mode(gui_app->process_list_text_view, GTK_WRAP_WORD_CHAR); // Wrap long lines
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(process_list_scrolled), GTK_WIDGET(gui_app->process_list_text_view));
+  gtk_frame_set_child(GTK_FRAME(process_list_frame), process_list_scrolled);
+  gtk_box_append(GTK_BOX(left_vbox), process_list_frame);
+
+  // Memory View (using GtkTextView)
+  GtkWidget *memory_view_frame = gtk_frame_new("Memory Map (60 Words)");
+  GtkWidget *memory_view_scrolled = gtk_scrolled_window_new();
+  gtk_widget_set_vexpand(memory_view_scrolled, TRUE); // Allow vertical expansion
+  gui_app->memory_text_view = GTK_TEXT_VIEW(gtk_text_view_new());
+  gui_app->memory_buffer = gtk_text_view_get_buffer(gui_app->memory_text_view);
+  gtk_text_view_set_editable(gui_app->memory_text_view, FALSE);
+  gtk_text_view_set_cursor_visible(gui_app->memory_text_view, FALSE);
+  gtk_widget_add_css_class(GTK_WIDGET(gui_app->memory_text_view), "monospace-memory-view"); // Add CSS class
+  gtk_text_view_set_wrap_mode(gui_app->memory_text_view, GTK_WRAP_NONE);
+  gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(memory_view_scrolled), GTK_WIDGET(gui_app->memory_text_view));
+  gtk_frame_set_child(GTK_FRAME(memory_view_frame), memory_view_scrolled);
+  gtk_box_append(GTK_BOX(left_vbox), memory_view_frame);
 
   // Right Pane (Logs and Output - Vertical Paned)
   GtkWidget *right_vpaned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
@@ -922,7 +1114,8 @@ static void activate(GtkApplication *app, gpointer user_data)
                                     "button.submit-button:hover { background: #e68a00; }\n"
                                     ".input-frame { border: 2px solid #ff9800; background-color: #fff3e0; border-radius: 5px; padding: 10px; margin: 10px; }\n"
                                     ".input-flash { border: 2px solid #f44336; background-color: #ffebee; border-radius: 3px; }\n"
-                                    "entry.input-flash { color: #d32f2f; font-weight: bold; }\n");
+                                    "entry.input-flash { color: #d32f2f; font-weight: bold; }\n"
+                                    ".monospace-memory-view { font-family: Monospace; font-size: small; }\n");
   gtk_style_context_add_provider_for_display(
       gtk_widget_get_display(gui_app->main_window),
       GTK_STYLE_PROVIDER(provider),

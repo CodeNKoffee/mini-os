@@ -135,7 +135,7 @@ static int allocateMemory(SystemState *sys, int words)
 }
 
 // Returns true on success, false on failure
-bool loadProgram(SystemState *sys, const char *filename)
+bool loadProgram(SystemState *sys, const char *filename, int arrivalTime)
 {
   if (sys->processCount >= MAX_PROCESSES)
   {
@@ -202,7 +202,7 @@ bool loadProgram(SystemState *sys, const char *filename)
   pcb->programCounter = 0;
   pcb->memoryLowerBound = lb;
   pcb->memoryUpperBound = ub;
-  pcb->arrivalTime = sys->clockCycle;
+  pcb->arrivalTime = arrivalTime;
   pcb->blockedOnResource = (ResourceType)-1; // Use -1 to indicate not blocked
   pcb->quantumRemaining = 0;
   pcb->mlfqLevel = 0; // Start at highest level
@@ -271,7 +271,7 @@ bool loadProgram(SystemState *sys, const char *filename)
   }
 
   sim_log(sys, "Loaded P%d: lines=%d, mem=[%d..%d], arrival=%d",
-          pcb->programNumber, linesRead, lb, ub, sys->clockCycle);
+          pcb->programNumber, linesRead, lb, ub, pcb->arrivalTime);
   sys->processCount++;
   notify_state_update(sys); // Notify GUI about the new process
   return true;
