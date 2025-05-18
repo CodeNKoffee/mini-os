@@ -1,6 +1,3 @@
-// main.c
-// A mini-OS simulator supporting FCFS, Round‐Robin, and Multilevel Feedback Queue (MLFQ)
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,13 +8,12 @@
 #define MAX_PROGRAM_LINES 50
 #define MAX_LINE_LENGTH 100
 #define NUM_VARIABLES 3
-#define PCB_SIZE 5 // for storing PCB fields in memory (optional)
+#define PCB_SIZE 5
 #define MAX_PROCESSES 10
 #define MAX_QUEUE_SIZE 10
 #define MLFQ_LEVELS 4
-#define NUM_RESOURCES 3 // file, userInput, userOutput
+#define NUM_RESOURCES 3
 
-// Scheduling policies
 typedef enum
 {
   SCHED_FCFS,
@@ -25,7 +21,6 @@ typedef enum
   SCHED_MLFQ
 } SchedulerType;
 
-// Process states
 typedef enum
 {
   NEW,
@@ -35,7 +30,6 @@ typedef enum
   TERMINATED
 } ProcessState;
 
-// Resources for semaphores
 typedef enum
 {
   RESOURCE_FILE,
@@ -43,29 +37,26 @@ typedef enum
   RESOURCE_USER_OUTPUT
 } ResourceType;
 
-// A memory word can hold a name and a value
 typedef struct
 {
   char name[50];
   char value[50];
 } MemoryWord;
 
-// Process Control Block
 typedef struct
 {
   int processID;
   ProcessState state;
-  int priority; // used for resource-unblocking (lower=more urgent)
+  int priority;
   int programCounter;
   int memoryLowerBound;
   int memoryUpperBound;
   int arrivalTime;
   ResourceType blockedOnResource;
-  int quantumRemaining; // time‐slice left (RR & MLFQ)
-  int mlfqLevel;        // current level (0 highest … MLFQ_LEVELS-1 lowest)
+  int quantumRemaining;
+  int mlfqLevel;
 } PCB;
 
-// Mutex with a FIFO + priority‐based blocked queue
 typedef struct
 {
   bool locked;
@@ -74,7 +65,6 @@ typedef struct
   int head, tail, size;
 } Mutex;
 
-// Overall system state
 typedef struct
 {
   MemoryWord memory[MEMORY_SIZE];
@@ -85,11 +75,9 @@ typedef struct
 
   Mutex mutexes[NUM_RESOURCES];
 
-  // FCFS/RR ready queue
   int readyQueue[MAX_QUEUE_SIZE];
   int readyHead, readyTail, readySize;
 
-  // MLFQ ready queues per level
   int mlfqRQ[MLFQ_LEVELS][MAX_QUEUE_SIZE];
   int mlfqHead[MLFQ_LEVELS], mlfqTail[MLFQ_LEVELS], mlfqSize[MLFQ_LEVELS];
 
@@ -97,13 +85,11 @@ typedef struct
   int clockCycle;
 } SystemState;
 
-// Global
 SystemState osSystem;
 SchedulerType schedulerType;
 int rrQuantum;
 int mlfqQuantum[MLFQ_LEVELS] = {1, 2, 4, 8};
 
-// Function prototypes
 void initializeSystem(SystemState *sys);
 int allocateMemory(SystemState *sys, int words);
 void loadProgram(SystemState *sys, const char *filename, int arrivalTime);
@@ -138,8 +124,6 @@ int dequeueMutexBlocked(Mutex *m);
 void blockProcess(SystemState *sys, int pid, ResourceType r);
 void unblockProcess(SystemState *sys, ResourceType r);
 
-// ---------------- Implementation ----------------
-
 void initializeSystem(SystemState *sys)
 {
   sys->memoryPointer = 0;
@@ -152,14 +136,11 @@ void initializeSystem(SystemState *sys)
     sys->memory[i].name[0] = 0;
     sys->memory[i].value[0] = 0;
   }
-  // Ready queue
   sys->readyHead = sys->readyTail = sys->readySize = 0;
-  // MLFQ queues
   for (int l = 0; l < MLFQ_LEVELS; l++)
   {
     sys->mlfqHead[l] = sys->mlfqTail[l] = sys->mlfqSize[l] = 0;
   }
-  // Mutexes
   for (int i = 0; i < NUM_RESOURCES; i++)
   {
     sys->mutexes[i].locked = false;
@@ -173,7 +154,7 @@ int allocateMemory(SystemState *sys, int words)
   if (sys->memoryPointer + words > MEMORY_SIZE)
   {
     printf("Error: Out of memory! Requested %d words, available %d.\n",
-           words, MEMORY_SIZE - sys->memoryPointer);
+          words, MEMORY_SIZE - sys->memoryPointer);
     return -1;
   }
   int start = sys->memoryPointer;
@@ -195,7 +176,6 @@ void loadProgram(SystemState *sys, const char *filename, int arrivalTime)
     return;
   }
 
-  // count non-empty lines
   char buf[MAX_LINE_LENGTH];
   int count = 0;
   while (fgets(buf, sizeof(buf), f))
@@ -233,11 +213,10 @@ void loadProgram(SystemState *sys, const char *filename, int arrivalTime)
   pcb->memoryLowerBound = lb;
   pcb->memoryUpperBound = ub;
   pcb->arrivalTime = arrivalTime;
-  pcb->blockedOnResource = RESOURCE_FILE; // dummy
+  pcb->blockedOnResource = RESOURCE_FILE;
   pcb->quantumRemaining = 0;
   pcb->mlfqLevel = 0;
 
-  // load instructions
   int idx = lb, line = 0;
   while (line < count && fgets(buf, sizeof(buf), f))
   {
@@ -251,7 +230,6 @@ void loadProgram(SystemState *sys, const char *filename, int arrivalTime)
   }
   fclose(f);
 
-  // init variable slots
   int varStart = lb + count;
   for (int i = 0; i < NUM_VARIABLES && varStart + i <= ub; i++)
   {
@@ -260,7 +238,7 @@ void loadProgram(SystemState *sys, const char *filename, int arrivalTime)
   }
 
   printf("Loaded P%d: lines=%d, mem=[%d..%d], arrival=%d\n",
-         pcb->processID, count, lb, ub, arrivalTime);
+        pcb->processID, count, lb, ub, arrivalTime);
   sys->processCount++;
 }
 
@@ -288,8 +266,6 @@ int findInstructionCount(SystemState *sys, int pid)
   }
   return cnt;
 }
-
-// ------------ Scheduling ------------
 
 void addToReadyQueue(SystemState *sys, int pid)
 {
@@ -348,8 +324,6 @@ int scheduleMLFQ(SystemState *sys)
   return -1;
 }
 
-// ------------- Interpreter -------------
-
 void interpretInstruction(SystemState *sys, int pid)
 {
   PCB *pcb = findPCB(sys, pid);
@@ -361,7 +335,6 @@ void interpretInstruction(SystemState *sys, int pid)
   int instCount = findInstructionCount(sys, pid);
   if (pcb->programCounter >= instCount)
   {
-    // terminate
     pcb->state = TERMINATED;
     printf("P%d done\n", pid);
     return;
@@ -379,7 +352,7 @@ void interpretInstruction(SystemState *sys, int pid)
 
   bool error = false;
   if (!cmd)
-  { /*NOP*/
+  {
   }
   else if (strcmp(cmd, "print") == 0)
   {
@@ -397,12 +370,10 @@ void interpretInstruction(SystemState *sys, int pid)
     }
     else if (strcmp(a2, "input") == 0)
     {
-      // interactive input
       do_assign(sys, pid, a1, a2);
     }
     else if (strcmp(a2, "readFile") == 0)
     {
-      // assign b readFile a  → do_readFile(a), then b = file_a
       if (!a3)
       {
         printf("Error in P%d: assign readFile missing source var\n", pid);
@@ -410,9 +381,7 @@ void interpretInstruction(SystemState *sys, int pid)
       }
       else
       {
-        // perform the read under the existing file‐mutex
         do_readFile(sys, pid, a3);
-        // build the auto‐generated var name "file_<a3>"
         char tmp[64];
         snprintf(tmp, sizeof(tmp), "file_%s", a3);
         char *cnt = getVariable(sys, pid, tmp);
@@ -423,14 +392,13 @@ void interpretInstruction(SystemState *sys, int pid)
         else
         {
           printf("Error in P%d: readFile did not create %s\n",
-                 pid, tmp);
+                pid, tmp);
           findPCB(sys, pid)->state = TERMINATED;
         }
       }
     }
     else
     {
-      // literal assignment
       setVariable(sys, pid, a1, a2);
     }
   }
@@ -481,8 +449,6 @@ void interpretInstruction(SystemState *sys, int pid)
   }
 }
 
-// -------- Variable Management --------
-
 int findVariableMemoryIndex(SystemState *sys, int pid, const char *var, bool findFree)
 {
   PCB *pcb = findPCB(sys, pid);
@@ -503,7 +469,7 @@ int findVariableMemoryIndex(SystemState *sys, int pid, const char *var, bool fin
       char prefix[20];
       snprintf(prefix, sizeof(prefix), "Var_%d_Free", pid);
       if ((sys->memory[i].name[0] == 0 ||
-           strncmp(sys->memory[i].name, prefix, strlen(prefix)) == 0) &&
+          strncmp(sys->memory[i].name, prefix, strlen(prefix)) == 0) &&
           firstFree < 0)
         firstFree = i;
     }
@@ -537,8 +503,6 @@ char *getVariable(SystemState *sys, int pid, const char *var)
   }
   return sys->memory[idx].value;
 }
-
-// -------- Instruction Handlers --------
 
 void do_print(SystemState *sys, int pid, char *arg1)
 {
@@ -606,7 +570,6 @@ void do_readFile(SystemState *sys, int pid, char *fileVar)
   }
   fclose(f);
 
-  // Build a valid variable name: "file_<originalVarName>"
   char varName[64];
   snprintf(varName, sizeof(varName), "file_%s", fileVar);
 
@@ -682,7 +645,6 @@ void unblockProcess(SystemState *sys, ResourceType r)
   Mutex *m = &sys->mutexes[r];
   if (m->size == 0)
     return;
-  // priority-based selection
   int bestPid = -1, bestPrio = 999, bestIdx = -1;
   for (int i = 0, idx = m->head; i < m->size; i++)
   {
@@ -698,7 +660,6 @@ void unblockProcess(SystemState *sys, ResourceType r)
   }
   if (bestPid < 0)
     return;
-  // remove from queue
   int idx = bestIdx;
   for (int k = 0; k < m->size - 1; k++)
   {
@@ -712,7 +673,6 @@ void unblockProcess(SystemState *sys, ResourceType r)
   PCB *pcb = findPCB(sys, bestPid);
   pcb->state = READY;
   pcb->blockedOnResource = -1;
-  // enqueue into proper ready queue
   if (schedulerType == SCHED_MLFQ)
   {
     addToMLFQ(sys, bestPid, pcb->mlfqLevel);
@@ -770,8 +730,6 @@ void do_semSignal(SystemState *sys, int pid, char *resName)
   }
 }
 
-// ------ Arrival & Simulation Loop ------
-
 void checkArrivals(SystemState *sys)
 {
   for (int i = 0; i < sys->processCount; i++)
@@ -793,7 +751,7 @@ void runSimulation(SystemState *sys)
 {
   int completed = 0;
   printf("Starting simulation with %s scheduler\n",
-         schedulerType == SCHED_FCFS ? "FCFS" : schedulerType == SCHED_RR ? "RR"
+        schedulerType == SCHED_FCFS ? "FCFS" : schedulerType == SCHED_RR ? "RR"
                                                                           : "MLFQ");
 
   while (completed < sys->processCount)
@@ -801,7 +759,6 @@ void runSimulation(SystemState *sys)
     printf("\n--- Cycle %d ---\n", sys->clockCycle);
     checkArrivals(sys);
 
-    // Dispatch if CPU idle
     if (sys->runningProcessID < 0)
     {
       int next;
@@ -835,29 +792,21 @@ void runSimulation(SystemState *sys)
       printf("CPU continues P%d\n", sys->runningProcessID);
     }
 
-    // Execute one instruction
     if (sys->runningProcessID >= 0)
     {
       PCB *pcb = findPCB(sys, sys->runningProcessID);
       interpretInstruction(sys, pcb->processID);
 
-      // handle post‐execution
       if (pcb->state == TERMINATED)
       {
         printf("P%d terminated\n", pcb->processID);
         completed++;
         sys->runningProcessID = -1;
       }
-      else if (pcb->state == BLOCKED)
-      {
-        // already moved to blocked queue
-      }
       else if (pcb->state == RUNNING)
       {
-        // advance PC
         pcb->programCounter++;
 
-        // Check if process has finished after incrementing PC
         int instCount = findInstructionCount(sys, pcb->processID);
         if (pcb->programCounter >= instCount)
         {
@@ -869,7 +818,6 @@ void runSimulation(SystemState *sys)
         }
         else
         {
-          // quantum handling
           if (schedulerType == SCHED_RR)
           {
             pcb->quantumRemaining--;
@@ -887,7 +835,7 @@ void runSimulation(SystemState *sys)
             if (pcb->quantumRemaining <= 0)
             {
               printf("P%d MLFQ quantum expired at level %d\n",
-                     pcb->processID, pcb->mlfqLevel);
+                    pcb->processID, pcb->mlfqLevel);
               pcb->state = READY;
               int nl = pcb->mlfqLevel < MLFQ_LEVELS - 1 ? pcb->mlfqLevel + 1 : pcb->mlfqLevel;
               addToMLFQ(sys, pcb->processID, nl);
@@ -908,14 +856,11 @@ void runSimulation(SystemState *sys)
   printf("\nSimulation complete in %d cycles\n", sys->clockCycle);
 }
 
-// --------------------- main ---------------------
-
 int main()
 {
   char line[128];
   int choice;
 
-  // 1) Choose scheduler
   printf("Choose scheduler (1=FCFS, 2=RR, 3=MLFQ): ");
   if (!fgets(line, sizeof(line), stdin))
   {
@@ -924,9 +869,8 @@ int main()
   }
   choice = atoi(line);
   if (choice < 1 || choice > 3)
-    choice = 1; // default FCFS
+    choice = 1;
 
-  // 2) If RR, ask for quantum
   if (choice == 2)
   {
     schedulerType = SCHED_RR;
@@ -949,13 +893,11 @@ int main()
     schedulerType = SCHED_FCFS;
   }
 
-  // 3) Initialize & load
   initializeSystem(&osSystem);
   loadProgram(&osSystem, "Program_1.txt", 0);
   loadProgram(&osSystem, "Program_2.txt", 1);
   loadProgram(&osSystem, "Program_3.txt", 2);
 
-  // 4) Run
   runSimulation(&osSystem);
   return 0;
 }
